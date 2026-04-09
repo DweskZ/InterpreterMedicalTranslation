@@ -1,0 +1,3 @@
+# Obsoleto: en Windows, nvidia-cublas-cu12 ya está en requirements.txt.
+# Si instalaste antes sin GPU, vuelve a ejecutar:
+#   python -m pip install -r requirements.txt
