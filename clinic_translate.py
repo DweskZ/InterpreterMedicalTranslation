@@ -51,8 +51,10 @@ def main() -> None:
                    help="Ventana de captura en segundos (default: 3).")
     p.add_argument("--max-history", type=int, default=50,
                    help="Maximo de lineas visibles por panel.")
-    p.add_argument("--vad", action="store_true",
-                   help="Filtro VAD de Whisper (puede omitir musica de fondo).")
+    p.add_argument("--vad", action="store_true", default=True,
+                   help="Filtro VAD de Silero dentro de Whisper (activo por defecto; usa --no-vad para desactivar).")
+    p.add_argument("--no-vad", dest="vad", action="store_false",
+                   help="Desactiva el filtro VAD.")
     p.add_argument("--device", default=None,
                    help="Loopback: numero o nombre parcial (--list-devices para ver).")
     p.add_argument("--mic", default=None,

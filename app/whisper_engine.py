@@ -1,11 +1,62 @@
 """Whisper transcription engine (faster-whisper with CUDA)."""
 from __future__ import annotations
 
+import re
 import threading
+from typing import Callable, Optional
 
 import numpy as np
 
 _lock = threading.Lock()
+
+
+class ModelHolder:
+    """Contenedor thread-safe del modelo Whisper activo.
+
+    Permite cambiar de modelo en caliente sin reiniciar la app.
+    El worker siempre lee `holder.model` justo antes de cada transcripción.
+    """
+
+    def __init__(self, model, size: str) -> None:
+        self._model = model
+        self._size = size
+        self._rw_lock = threading.Lock()
+
+    @property
+    def model(self):
+        with self._rw_lock:
+            return self._model
+
+    @property
+    def size(self) -> str:
+        with self._rw_lock:
+            return self._size
+
+    def swap(
+        self,
+        new_size: str,
+        on_start: Optional[Callable[[str], None]] = None,
+        on_done: Optional[Callable[[str], None]] = None,
+        on_error: Optional[Callable[[str, Exception], None]] = None,
+    ) -> None:
+        """Carga un nuevo modelo en background y lo reemplaza atómicamente."""
+
+        def _bg() -> None:
+            if on_start:
+                on_start(new_size)
+            try:
+                new_model = load(new_size)
+                with self._rw_lock:
+                    self._model = new_model
+                    self._size = new_size
+                if on_done:
+                    on_done(new_size)
+            except Exception as exc:  # noqa: BLE001
+                if on_error:
+                    on_error(new_size, exc)
+
+        threading.Thread(target=_bg, daemon=True).start()
+
 
 MEDICAL_PROMPT = (
     "Medical interpreter in a hospital. Emergency room, surgery, pediatrics, cardiology, "
@@ -28,7 +79,53 @@ MEDICAL_PROMPT = (
     "discharge instructions, follow-up appointment, referral, specialist."
 )
 
+# Versión corta (~25 tokens) usada como anclaje de dominio cuando el rolling
+# context ya ocupa el resto del espacio disponible en initial_prompt (~224 tokens).
+MEDICAL_PROMPT_SHORT = (
+    "Medical interpreter. Hospital: emergency, surgery, cardiology, pediatrics, neurology. "
+    "Symptoms, medications, diagnosis, procedures, vital signs, allergies, prescriptions."
+)
 
+
+# ---------------------------------------------------------------------------
+# Hallucination filter
+# ---------------------------------------------------------------------------
+# Whisper genera estas frases cuando recibe silencio o audio de muy baja
+# energía. Son patrones documentados y reproducibles del modelo.
+_HALLUCINATION_EXACT: frozenset[str] = frozenset({
+    "you", "thank you", "thanks", "thanks for watching", "thanks for listening",
+    "bye", "goodbye", "ok", "okay", "uh", "um", "hmm", "hm",
+    "please subscribe", "like and subscribe", "subscribe",
+    "subtitles by", "translated by", "transcribed by",
+    "captions by", "closed captions",
+    "this video is brought to you by", "brought to you by",
+    "music", "silence",
+})
+
+_MUSIC_CHARS: frozenset[str] = frozenset("♪♫♬♩")
+
+
+def _is_hallucination(text: str) -> bool:
+    """True si el texto es una alucinación típica de Whisper en silencio."""
+    if not text:
+        return False
+    t = text.strip()
+    # Notación musical pura
+    if all(c in _MUSIC_CHARS or c.isspace() or c in ",.!?-[]" for c in t):
+        return True
+    # Normalizar y comparar contra lista negra
+    t_norm = re.sub(r"[^\w\s]", "", t.lower()).strip()
+    if t_norm in _HALLUCINATION_EXACT:
+        return True
+    # Texto de 1-2 caracteres reales casi siempre es ruido
+    if len(t_norm.replace(" ", "")) <= 2:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
 def _smoke_test(model) -> None:
     segs, _ = model.transcribe(
         np.zeros(32000, dtype=np.float32),
@@ -55,18 +152,22 @@ def load(model_size: str):
     raise RuntimeError("No se pudo cargar Whisper en ninguna configuracion.")
 
 
+# ---------------------------------------------------------------------------
+# Transcription
+# ---------------------------------------------------------------------------
 def transcribe(model, audio: np.ndarray, language: str, *,
                vad_filter: bool, prompt: str = "") -> str:
     """Transcribe an audio chunk (thread-safe via lock)."""
     if audio.size < 8000:
         return ""
     audio = np.clip(audio.astype(np.float32), -1.0, 1.0)
-    kwargs: dict = dict(
-        language=language, task="transcribe", beam_size=1,
-        vad_filter=vad_filter, without_timestamps=True,
-    )
+    kwargs: dict = {
+        "language": language, "task": "transcribe", "beam_size": 1,
+        "vad_filter": vad_filter, "without_timestamps": True,
+    }
     if prompt:
         kwargs["initial_prompt"] = prompt
     with _lock:
         segs, _ = model.transcribe(audio, **kwargs)
-        return " ".join(s.text.strip() for s in segs if s.text).strip()
+        result = " ".join(s.text.strip() for s in segs if s.text).strip()
+    return "" if _is_hallucination(result) else result
