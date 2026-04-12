@@ -155,19 +155,37 @@ def load(model_size: str):
 # ---------------------------------------------------------------------------
 # Transcription
 # ---------------------------------------------------------------------------
-def transcribe(model, audio: np.ndarray, language: str, *,
-               vad_filter: bool, prompt: str = "") -> str:
-    """Transcribe an audio chunk (thread-safe via lock)."""
+def transcribe(
+    model,
+    audio: np.ndarray,
+    language: "str | None",
+    *,
+    vad_filter: bool,
+    prompt: str = "",
+) -> tuple[str, str]:
+    """Transcribe an audio chunk (thread-safe via lock).
+
+    Args:
+        language: código ISO 639-1 ("en", "es") o None para auto-detección.
+
+    Returns:
+        (texto, idioma_detectado)  — idioma_detectado es "" si no se pudo determinar.
+    """
     if audio.size < 8000:
-        return ""
+        return "", ""
     audio = np.clip(audio.astype(np.float32), -1.0, 1.0)
     kwargs: dict = {
-        "language": language, "task": "transcribe", "beam_size": 1,
+        "task": "transcribe", "beam_size": 1,
         "vad_filter": vad_filter, "without_timestamps": True,
     }
+    if language:
+        kwargs["language"] = language
     if prompt:
         kwargs["initial_prompt"] = prompt
     with _lock:
-        segs, _ = model.transcribe(audio, **kwargs)
+        segs, info = model.transcribe(audio, **kwargs)
         result = " ".join(s.text.strip() for s in segs if s.text).strip()
-    return "" if _is_hallucination(result) else result
+    detected = (info.language or "").split("-")[0].lower() if hasattr(info, "language") else ""
+    if _is_hallucination(result):
+        return "", ""
+    return result, detected

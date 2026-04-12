@@ -1,87 +1,106 @@
-# Clinic Translate (local)
+# Clinic Translate
 
-Asistente **100 % local** (en uso): captura el audio que suena en **Windows** (loopback del altavoz predeterminado), transcribe en **inglés** con **faster-whisper** y muestra **español** con **Argos Translate** en una ventana siempre visible.
+Traductor **EN ↔ ES** en tiempo real para intérpretes médicos. Captura el audio del sistema (loopback WASAPI), lo transcribe y muestra la traducción al idioma opuesto en una ventana siempre visible.
 
-**Aviso:** texto asistencial, no sustituye criterio profesional; en entornos sanitarios revisar siempre la salida.
+Dos motores de transcripción disponibles:
+
+| Motor | Modo | Ventajas | Requisitos |
+|-------|------|----------|------------|
+| **Whisper** (default) | Local, GPU/CPU | Sin costo, sin internet, rolling context | NVIDIA GPU recomendada |
+| **Deepgram Nova-3** | Cloud, WebSocket streaming | Detecta EN/ES automáticamente (code-switching) | API key + internet |
+
+La traducción usa **Google Translate** (natural, gratis vía `deep_translator`) con fallback a **Argos Translate** (offline) si no hay internet.
+
+> **Aviso:** herramienta asistencial. No sustituye criterio profesional. En entornos sanitarios revisar siempre la salida.
 
 ## Requisitos
 
-- Windows 10/11, Python **3.10+**
-- NVIDIA + CUDA recomendado (en CPU también funciona, con más latencia)
-- ~16 GB RAM mínimo práctico; en GPU 6 GB VRAM probar `--model base` o `small`
+- Windows 10/11
+- Python **3.10+**
+- NVIDIA GPU + CUDA recomendado (funciona en CPU con más latencia)
+- ~16 GB RAM mínimo; en GPU 6 GB VRAM probar `--model base`
 
-## Instalación
-
-En PowerShell:
+## Instalación rápida
 
 ```powershell
-cd e:\AITrasncriptRealTime
+# 1. Clonar o copiar el proyecto
+cd E:\AITrasncriptRealTime
+
+# 2. Crear entorno virtual
 python -m venv .venv
+
+# 3. Activar el entorno virtual
 .\.venv\Scripts\Activate.ps1
+
+# 4. Instalar dependencias
 python -m pip install -r requirements.txt
-```
 
-En **Windows**, `requirements.txt` instala `nvidia-cublas-cu12` y **`nvidia-cuda-runtime-cu12`** (sin `cudart64_12.dll` la DLL de cuBLAS no carga). El script también **anteponde** esas carpetas al `PATH`. Si tu `.venv` es antiguo: `python -m pip install -r requirements.txt`.
-
-En este repo ya se creó `.venv` en la máquina de desarrollo; en otra PC repite los mismos pasos.
-
-**Atajo:** con el venv listo puedes usar `.\run.ps1` (equivale a invocar `clinic_translate.py` con el Python del venv).
-
-**Una vez** (descarga del par idioma Argos; requiere internet):
-
-```powershell
-.\.venv\Scripts\Activate.ps1
+# 5. Descargar paquetes de idioma Argos (una sola vez, requiere internet)
 python clinic_translate.py --setup-langs
 ```
 
-La primera ejecución de Whisper puede descargar el modelo (también requiere internet si no está en caché).
+## Configuración de Deepgram (opcional)
+
+Si quieres usar Deepgram Nova-3 como motor de transcripción:
+
+1. Crea una cuenta en [deepgram.com](https://deepgram.com) (tiene $200 de crédito gratis)
+2. Crea un archivo `.env` en la raíz del proyecto:
+
+```
+DEEPGRAM_API_KEY=tu_api_key_aqui
+```
 
 ## Uso
 
-1. Pon el **altavoz predeterminado** de Windows como la salida por la que oyes la llamada o el vídeo.
-2. Reproduce audio en **inglés** por ese dispositivo.
-3. Ejecuta:
-
 ```powershell
+# Iniciar con Whisper (default, local)
 .\run.ps1 --model base
-# o: .\.venv\Scripts\python.exe clinic_translate.py --model base
+
+# Iniciar directamente con Deepgram (cloud)
+.\run.ps1 --backend deepgram
+
+# También puedes cambiar el backend desde la interfaz gráfica en cualquier momento
 ```
 
-La ventana debe mostrar cada pocos segundos el nivel en dBFS aunque no haya voz: si se queda muy bajo (por debajo de unos -60) mientras reproduces un vídeo, el audio no está yendo al altavoz predeterminado que Windows usa para el loopback (FxSound, otro dispositivo, volumen en cero, etc.).
+### Interfaz
 
-Opciones útiles:
+- **Panel izquierdo — TRANSCRIPCIÓN:** todo lo que se escucha, en el idioma original (inglés o español)
+- **Panel derecho — TRADUCCIÓN:** la traducción al idioma opuesto
+- **Toolbar:** selector de backend (Whisper/Deepgram), modelo Whisper, normalización de audio, botón Limpiar
+
+### Opciones de línea de comandos
 
 | Opción | Descripción |
 |--------|-------------|
-| `--model tiny` | Menor VRAM/RAM, peor calidad |
-| `--model small` | Mejor calidad si la GPU aguanta |
-| `--chunk-seconds 2.5` | Ventanas más cortas (más carga) |
-| `--vad` | Filtro de voz de Whisper ON (por defecto OFF: mejor para audio del PC) |
+| `--backend whisper` | Motor local (default) |
+| `--backend deepgram` | Motor cloud (requiere `.env` con API key) |
+| `--model base` | Modelo Whisper: `tiny`, `base`, `small`, `medium` (con/sin `.en`) |
+| `--chunk-seconds 3` | Ventana de captura en segundos |
+| `--max-history 50` | Máximo de líneas visibles por panel |
+| `--no-vad` | Desactivar filtro VAD |
+| `--device N` | Elegir dispositivo loopback específico |
+| `--list-devices` | Ver dispositivos disponibles |
 
-## Otra PC (p. ej. tu amigo)
-
-Copia la carpeta del proyecto (o clona el repo), crea `.venv` allí, `pip install -r requirements.txt`, `--setup-langs` y prueba con el mismo comando. Los modelos se guardan en caché de usuario (Whisper/Argos).
-
-**Nota:** `argostranslate` instala dependencias pesadas (p. ej. `torch`, `spacy`) solo para su pipeline interno; la traducción en sí sigue siendo local. La instalación puede tardar varios minutos.
-
-### Aviso de Hugging Face (“unauthenticated requests” / `HF_TOKEN`)
-
-Al descargar el modelo de Whisper, Hugging Face puede mostrar un aviso de peticiones sin token. **No es un error**: el programa puede seguir descargando. Si quieres límites más altos y menos mensajes, crea un token en [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) y en PowerShell, antes de ejecutar:
+## Otra PC
 
 ```powershell
-$env:HF_TOKEN = "hf_xxxxxxxx"
-.\run.ps1
+# Clonar el repo
+git clone <url-del-repo>
+cd AITrasncriptRealTime
+
+# Crear venv e instalar
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python clinic_translate.py --setup-langs
+
+# Ejecutar
+.\run.ps1 --model base
 ```
 
-(O usa `hf auth login` si tienes la CLI de Hugging Face instalada.)
+## Solución de problemas
 
-## Problemas frecuentes
-
-- **`RuntimeError: Library cublas64_12.dll is not found`:** suele faltar **`cudart64_12.dll`** (runtime CUDA), no solo cuBLAS. `requirements.txt` ya incluye `nvidia-cublas-cu12` y `nvidia-cuda-runtime-cu12`; ejecuta `python -m pip install -r requirements.txt` y reinicia la terminal. El programa registra rutas y actualiza `PATH`. Alternativa: instalar [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-downloads). Si falla la GPU, se usa **CPU** (más lento).
-
-- **`[Audio] '_Speaker' object has no attribute 'recorder'`:** corregido en versiones recientes: en Windows el loopback se toma como micrófono virtual (`Loopback`), no del objeto `Speaker`. Actualiza `clinic_translate.py` desde este repo.
-- **`fromstring is removed, use frombuffer`:** viene de **soundcard** con **NumPy 2**; el script aplica un parche al arrancar. Si aún falla, prueba `pip install "numpy<2"` en el venv.
-- **`NoneType` ... integer / fallos raros de audio:** en Windows la captura WASAPI (**soundcard**) usa **COM**; hay que inicializarlo en **el mismo hilo** que graba. El worker llama `CoInitializeEx` al arrancar. Si aún falla, el código intenta un **respaldo con sounddevice** (PortAudio). Prueba también desactivar FxSound o cambiar el altavoz predeterminado.
-- **Sin texto / error de audio:** comprueba que hay salida por el altavoz predeterminado y que el volumen no está silenciado.
-- **CUDA / GPU:** actualiza drivers NVIDIA; si falla, el script intenta CPU con `int8`.
-- **Permisos PowerShell:** `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` si no deja activar el venv.
+- **`RuntimeError: Library cublas64_12.dll is not found`** — Ejecutar `pip install -r requirements.txt` (incluye CUDA runtime). Alternativa: instalar [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-downloads). Si falla GPU se usa CPU automáticamente.
+- **Sin texto / error de audio** — Verificar que el altavoz predeterminado de Windows es la salida por la que suena el audio. Usar `--list-devices` para ver dispositivos.
+- **Permisos PowerShell** — `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+- **Aviso Hugging Face (`HF_TOKEN`)** — No es error. Opcional: crear token en [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) y `$env:HF_TOKEN = "hf_..."` antes de ejecutar.

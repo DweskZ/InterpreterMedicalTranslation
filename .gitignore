@@ -4,9 +4,17 @@ __pycache__/
 .pytest_cache/
 .idea/
 .vscode/
+.env
 
 # Build / distribución — no subir al repo (son pesados: ~1GB)
 dist/
 build/
 dist_assets/
 *.spec.bak
+
+# Assets temporales de Cursor
+assets/
+agent-tools/
+agent-transcripts/
+mcps/
+terminals/

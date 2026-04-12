@@ -4,6 +4,10 @@ PyAudioWPatch>=0.2.12
 numpy>=1.24.0
 scipy>=1.10.0
 argostranslate>=1.9.6
+# Traducción natural (Google Translate, sin API key) - fallback a Argos si sin internet
+deep_translator>=1.11.4
+# WebSocket para Deepgram streaming
+websockets>=13.0
 # Windows + GPU: runtime CUDA 12
 nvidia-cublas-cu12>=12.1.0; platform_system == "Windows"
 nvidia-cuda-runtime-cu12>=12.1.0; platform_system == "Windows"

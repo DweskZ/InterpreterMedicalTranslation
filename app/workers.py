@@ -6,7 +6,7 @@ import threading
 import time
 import traceback
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -40,7 +40,7 @@ def _normalize_rms(audio: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Rolling context
+# Rolling context (solo Whisper)
 # ---------------------------------------------------------------------------
 class _RollingContext:
     """Ventana deslizante de palabras recientes para usar como initial_prompt.
@@ -91,8 +91,12 @@ class CaptionLine:
     source: str
     translated: str
     ts: float
+    source_lang: str = field(default="en")   # "en" o "es"
 
 
+# ---------------------------------------------------------------------------
+# Worker Whisper (local)
+# ---------------------------------------------------------------------------
 def worker_system(
     out_q: "queue.Queue[Optional[CaptionLine]]",
     stop_evt: threading.Event,
@@ -103,8 +107,8 @@ def worker_system(
     prompt: str,
     normalize_evt: threading.Event,
 ) -> None:
-    """Loopback audio -> Whisper EN (rolling context) -> Argos EN->ES."""
-    print(f"[Sistema] Capturando de: {stream.device['name']}", flush=True)
+    """Loopback audio -> Whisper (auto-detecta EN/ES) -> traducción natural bidireccional."""
+    print(f"[Whisper] Capturando de: {stream.device['name']}", flush=True)
 
     ctx = _RollingContext()
 
@@ -112,7 +116,8 @@ def worker_system(
         try:
             raw = stream.read(chunk_sec, 16000)
         except Exception as e:
-            out_q.put(CaptionLine(source="", translated=f"[Audio ERROR] {e}", ts=time.time()))
+            out_q.put(CaptionLine(source="", translated=f"[Audio ERROR] {e}",
+                                  ts=time.time(), source_lang="en"))
             print(traceback.format_exc(), file=sys.stderr)
             time.sleep(1.0)
             continue
@@ -124,53 +129,98 @@ def worker_system(
             raw = _normalize_rms(raw)
 
         effective_prompt = ctx.build_prompt(prompt, whisper_engine.MEDICAL_PROMPT_SHORT)
-        text_en = whisper_engine.transcribe(
-            model_holder.model, raw, language="en",
+
+        # language=None → Whisper auto-detecta EN o ES
+        text, lang = whisper_engine.transcribe(
+            model_holder.model, raw, language=None,
             vad_filter=vad_filter, prompt=effective_prompt,
         )
 
-        if text_en:
-            ctx.update(text_en)
+        if text:
+            ctx.update(text)
+            lang = lang or "en"
+            to_lang = "en" if lang == "es" else "es"
             try:
-                text_es = translation.en_to_es(text_en)
+                translated = translation.translate_natural(text, lang, to_lang)
             except Exception as e:
-                text_es = f"[Traduccion ERROR] {e}"
-            out_q.put(CaptionLine(source=text_en, translated=text_es, ts=time.time()))
+                translated = f"[Traduccion ERROR] {e}"
+            out_q.put(CaptionLine(source=text, translated=translated,
+                                  ts=time.time(), source_lang=lang))
         else:
-            out_q.put(CaptionLine(source="", translated="", ts=time.time()))
+            out_q.put(CaptionLine(source="", translated="", ts=time.time(), source_lang="en"))
 
 
-# --- Tab del interprete (mic ES->EN) - deshabilitado por ahora ---
-#
-# def worker_mic(
-#     out_q: "queue.Queue[Optional[CaptionLine]]",
-#     stop_evt: threading.Event,
-#     model,
-#     chunk_sec: float,
-#     vad_filter: bool,
-#     stream: AudioStream,
-#     prompt: str,
-# ) -> None:
-#     """Microphone -> Whisper ES -> Argos ES->EN."""
-#     print(f"[Mic] Capturando de: {stream.device['name']}", flush=True)
-#
-#     while not stop_evt.is_set():
-#         try:
-#             raw = stream.read(chunk_sec, 16000)
-#         except Exception as e:
-#             out_q.put(CaptionLine(source="", translated=f"[Audio ERROR] {e}", ts=time.time()))
-#             print(traceback.format_exc(), file=sys.stderr)
-#             time.sleep(1.0)
-#             continue
-#
-#         text_es = whisper_engine.transcribe(
-#             model, raw, language="es", vad_filter=vad_filter, prompt=prompt)
-#
-#         if text_es:
-#             try:
-#                 text_en = translation.es_to_en(text_es)
-#             except Exception as e:
-#                 text_en = f"[Translation ERROR] {e}"
-#             out_q.put(CaptionLine(source=text_es, translated=text_en, ts=time.time()))
-#         else:
-#             out_q.put(CaptionLine(source="", translated="", ts=time.time()))
+# ---------------------------------------------------------------------------
+# Worker Deepgram (cloud) - WebSocket streaming con Nova-3
+# ---------------------------------------------------------------------------
+_DG_CHUNK_SEC: float = 0.1   # enviar audio cada 100ms para flujo continuo
+
+def worker_deepgram(
+    out_q: "queue.Queue[Optional[CaptionLine]]",
+    stop_evt: threading.Event,
+    api_key: str,
+    chunk_sec: float,
+    stream: AudioStream,
+    normalize_evt: threading.Event,
+) -> None:
+    """Loopback audio -> Deepgram Nova-3 (WebSocket streaming, code-switching EN/ES).
+
+    A diferencia de Whisper que acumula 3s de audio y procesa de golpe,
+    aquí enviamos audio cada 100ms como un flujo continuo. Deepgram
+    mantiene contexto internamente y devuelve frases completas.
+    """
+    from app.deepgram_engine import DeepgramStreamer
+
+    dev_rate = stream.dev_rate
+    print(f"[Deepgram] Capturando de: {stream.device['name']} ({dev_rate} Hz)", flush=True)
+
+    def _on_transcript(text: str, lang: str) -> None:
+        lang = lang or "en"
+        to_lang = "en" if lang == "es" else "es"
+        try:
+            translated = translation.translate_natural(text, lang, to_lang)
+        except Exception as e:
+            translated = f"[Traduccion ERROR] {e}"
+        out_q.put(CaptionLine(source=text, translated=translated,
+                               ts=time.time(), source_lang=lang))
+
+    def _on_error(msg: str) -> None:
+        out_q.put(CaptionLine(source="", translated=f"[Deepgram] {msg}",
+                               ts=time.time(), source_lang="en"))
+        print(f"[Deepgram] {msg}", file=sys.stderr, flush=True)
+
+    streamer: Optional[DeepgramStreamer] = None
+    try:
+        streamer = DeepgramStreamer(
+            api_key,
+            on_transcript=_on_transcript,
+            on_error=_on_error,
+            sample_rate=16000,
+        )
+        streamer.start()
+    except Exception as e:
+        out_q.put(CaptionLine(source="", translated=f"[Deepgram ERROR] {e}",
+                               ts=time.time(), source_lang="en"))
+        print(f"[Deepgram] Fallo al conectar: {e}", file=sys.stderr, flush=True)
+        return
+
+    try:
+        while not stop_evt.is_set():
+            try:
+                raw = stream.read(_DG_CHUNK_SEC, 16000)
+            except Exception as e:
+                _on_error(f"[Audio ERROR] {e}")
+                print(traceback.format_exc(), file=sys.stderr)
+                time.sleep(1.0)
+                continue
+
+            if normalize_evt.is_set():
+                raw = _normalize_rms(raw)
+
+            # Enviar TODO el audio (incluyendo silencio) para que Deepgram
+            # mantenga el contexto temporal y detecte correctamente
+            # el inicio y fin de cada utterance.
+            streamer.send_audio(raw)
+    finally:
+        if streamer:
+            streamer.stop()
