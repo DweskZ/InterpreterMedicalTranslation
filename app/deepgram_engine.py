@@ -249,12 +249,4 @@ class DeepgramStreamer:
         if _is_noise(text):
             return
 
-        if _is_repetitive(text):
-            print(f"[Deepgram] Repetitivo descartado: {text[:80]!r}", flush=True)
-            return
-
-        if _MIN_CONFIDENCE > 0 and confidence < _MIN_CONFIDENCE:
-            print(f"[Deepgram] Confianza baja ({confidence:.2f}): {text[:60]!r}", flush=True)
-            return
-
         self._on_transcript(text, lang)

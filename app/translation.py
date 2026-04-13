@@ -66,7 +66,6 @@ def _is_garbage(result: str, source: str) -> bool:
     """True si el resultado de la traducción parece basura.
 
     Detecta:
-    - Texto repetitivo (misma palabra ocupa >40% del total)
     - Artefactos de parseo de deep_translator (@@, ###, etc.)
     - Resultado mucho más largo que el texto original (>5x en caracteres)
     """
@@ -80,14 +79,6 @@ def _is_garbage(result: str, source: str) -> bool:
     # Resultado demasiado largo en relación al original (probable bucle)
     if len(source) > 0 and len(result) > max(200, len(source) * 5):
         return True
-
-    # Texto repetitivo (solo en frases largas, no afecta frases cortas normales)
-    words = re.sub(r"[^\w\s]", "", result.lower()).split()
-    if len(words) >= 5:
-        counts = collections.Counter(words)
-        _, top_count = counts.most_common(1)[0]
-        if top_count / len(words) > 0.45:
-            return True
 
     return False
 

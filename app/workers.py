@@ -195,7 +195,7 @@ def worker_deepgram(
             api_key,
             on_transcript=_on_transcript,
             on_error=_on_error,
-            sample_rate=16000,
+            sample_rate=dev_rate,
         )
         streamer.start()
     except Exception as e:
@@ -207,7 +207,7 @@ def worker_deepgram(
     try:
         while not stop_evt.is_set():
             try:
-                raw = stream.read(_DG_CHUNK_SEC, 16000)
+                raw = stream.read(_DG_CHUNK_SEC, dev_rate)
             except Exception as e:
                 _on_error(f"[Audio ERROR] {e}")
                 print(traceback.format_exc(), file=sys.stderr)
