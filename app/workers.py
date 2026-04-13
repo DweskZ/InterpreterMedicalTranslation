@@ -108,7 +108,7 @@ class CaptionLine:
 # ---------------------------------------------------------------------------
 # Worker Whisper (local)
 # ---------------------------------------------------------------------------
-_ES_FALLBACK_THRESHOLD: float = 0.7  # prob mínima EN para no intentar ES
+_ES_FALLBACK_THRESHOLD: float = 0.8  # si confianza EN < 80%, probar ES
 _DEDUP_HISTORY: int = 3              # líneas recientes para deduplicar
 
 
@@ -146,20 +146,14 @@ def worker_system(
 
         effective_prompt = ctx.build_prompt(prompt, whisper_engine.MEDICAL_PROMPT_SHORT)
 
-        # Pasada 1: forzar inglés (idioma principal en contexto médico USA)
-        text, lang, prob = whisper_engine.transcribe(
-            model_holder.model, raw, language="en",
+        # Auto-detección: Whisper decide si es EN o ES.
+        # IMPORTANTE: los modelos ".en" NO pueden detectar español.
+        # Usar modelos sin ".en" (base, small, medium) para bilingüe.
+        text, detected_lang, prob = whisper_engine.transcribe(
+            model_holder.model, raw, language=None,
             vad_filter=vad_filter, prompt=effective_prompt,
         )
-
-        # Pasada 2: si la confianza EN es baja, intentar español
-        if prob < _ES_FALLBACK_THRESHOLD or not text:
-            text_es, lang_es, prob_es = whisper_engine.transcribe(
-                model_holder.model, raw, language="es",
-                vad_filter=vad_filter, prompt=effective_prompt,
-            )
-            if text_es and prob_es > prob:
-                text, lang, prob = text_es, lang_es, prob_es
+        lang = detected_lang if detected_lang in ("en", "es") else "en"
 
         if text:
             # Deduplicar líneas consecutivas idénticas

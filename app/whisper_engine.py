@@ -1,6 +1,7 @@
 """Whisper transcription engine (faster-whisper with CUDA)."""
 from __future__ import annotations
 
+import collections
 import re
 import threading
 from typing import Callable, Optional
@@ -86,6 +87,11 @@ MEDICAL_PROMPT_SHORT = (
     "Symptoms, medications, diagnosis, procedures, vital signs, allergies, prescriptions."
 )
 
+MEDICAL_PROMPT_SHORT_ES = (
+    "Intérprete médico. Hospital: emergencia, cirugía, cardiología, pediatría, neurología. "
+    "Síntomas, medicamentos, diagnóstico, procedimientos, signos vitales, alergias, recetas."
+)
+
 
 # ---------------------------------------------------------------------------
 # Hallucination filter
@@ -104,20 +110,64 @@ _HALLUCINATION_EXACT: frozenset[str] = frozenset({
 
 _MUSIC_CHARS: frozenset[str] = frozenset("♪♫♬♩")
 
+# Caracteres fuera del rango Latin + Latin-Extended + puntuación común.
+# Detecta CJK, árabe, cirílico, coreano, etc.
+_NON_LATIN_RE = re.compile(
+    r'[\u4e00-\u9fff'       # CJK Unified Ideographs
+    r'\u3040-\u309f'         # Hiragana
+    r'\u30a0-\u30ff'         # Katakana
+    r'\u3400-\u4dbf'         # CJK Extension A
+    r'\u0400-\u04ff'         # Cyrillic
+    r'\u0600-\u06ff'         # Arabic
+    r'\u0750-\u077f'         # Arabic Supplement
+    r'\uac00-\ud7af'         # Hangul (Korean)
+    r'\u3000-\u303f'         # CJK Symbols
+    r'\uff00-\uffef]',       # Fullwidth Forms
+)
+
+_REPETITION_MAX_RATIO: float = 0.40
+_REPETITION_BIGRAM_RATIO: float = 0.35
+_REPETITION_MIN_WORDS: int = 4
+
+
+def _strip_non_latin(text: str) -> str:
+    """Elimina caracteres no EN/ES. Descarta si queda <50% del original."""
+    if not text:
+        return ""
+    cleaned = _NON_LATIN_RE.sub("", text).strip()
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    if len(text) > 0 and len(cleaned) < len(text) * 0.5:
+        return ""
+    return cleaned
+
+
+def _is_repetitive(text: str) -> bool:
+    """True si el texto tiene repetición interna excesiva (alucinación en loop)."""
+    words = re.sub(r"[^\w\s]", "", text.lower()).split()
+    if len(words) < _REPETITION_MIN_WORDS:
+        return False
+    counts = collections.Counter(words)
+    _, top_count = counts.most_common(1)[0]
+    if top_count / len(words) > _REPETITION_MAX_RATIO:
+        return True
+    bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)]
+    if bigrams:
+        _, bi_top = collections.Counter(bigrams).most_common(1)[0]
+        if bi_top / len(bigrams) > _REPETITION_BIGRAM_RATIO:
+            return True
+    return False
+
 
 def _is_hallucination(text: str) -> bool:
     """True si el texto es una alucinación típica de Whisper en silencio."""
     if not text:
         return False
     t = text.strip()
-    # Notación musical pura
     if all(c in _MUSIC_CHARS or c.isspace() or c in ",.!?-[]" for c in t):
         return True
-    # Normalizar y comparar contra lista negra
     t_norm = re.sub(r"[^\w\s]", "", t.lower()).strip()
     if t_norm in _HALLUCINATION_EXACT:
         return True
-    # Texto de 1-2 caracteres reales casi siempre es ruido
     if len(t_norm.replace(" ", "")) <= 2:
         return True
     return False
@@ -162,17 +212,19 @@ def transcribe(
     *,
     vad_filter: bool,
     prompt: str = "",
-) -> tuple[str, str]:
+) -> tuple[str, str, float]:
     """Transcribe an audio chunk (thread-safe via lock).
 
     Args:
         language: código ISO 639-1 ("en", "es") o None para auto-detección.
 
     Returns:
-        (texto, idioma_detectado)  — idioma_detectado es "" si no se pudo determinar.
+        (texto, idioma_detectado, language_probability)
+        idioma_detectado es "" si no se pudo determinar.
+        language_probability es 0.0-1.0 indicando confianza del idioma.
     """
     if audio.size < 8000:
-        return "", ""
+        return "", "", 0.0
     audio = np.clip(audio.astype(np.float32), -1.0, 1.0)
     kwargs: dict = {
         "task": "transcribe", "beam_size": 1,
@@ -186,6 +238,17 @@ def transcribe(
         segs, info = model.transcribe(audio, **kwargs)
         result = " ".join(s.text.strip() for s in segs if s.text).strip()
     detected = (info.language or "").split("-")[0].lower() if hasattr(info, "language") else ""
+    prob = float(info.language_probability) if hasattr(info, "language_probability") else 0.0
+
     if _is_hallucination(result):
-        return "", ""
-    return result, detected
+        return "", "", 0.0
+
+    result = _strip_non_latin(result)
+    if not result:
+        return "", "", 0.0
+
+    if _is_repetitive(result):
+        print(f"[Whisper] Repetición descartada: {result[:80]!r}", flush=True)
+        return "", "", 0.0
+
+    return result, detected, prob

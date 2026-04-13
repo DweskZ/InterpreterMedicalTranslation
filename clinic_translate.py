@@ -70,13 +70,13 @@ def main() -> None:
                        "'deepgram' (cloud, Nova-3), o 'assemblyai' (cloud, Universal Streaming). "
                        "Las opciones cloud requieren API key en .env."
                    ))
-    p.add_argument("--model", default="small.en",
+    p.add_argument("--model", default="base",
                    choices=["tiny", "tiny.en", "base", "base.en", "small", "small.en",
                             "medium", "medium.en"],
-                   help="Modelo Whisper (default: small.en). Los '.en' son más precisos para inglés. "
-                        "Modelos más grandes = menos errores pero más RAM GPU.")
-    p.add_argument("--chunk-seconds", type=float, default=3.0,
-                   help="Ventana de captura en segundos (default: 3).")
+                   help="Modelo Whisper (default: base). Los '.en' son SOLO inglés. "
+                        "Para detectar español e inglés usar modelos SIN '.en'.")
+    p.add_argument("--chunk-seconds", type=float, default=5.0,
+                   help="Ventana de captura en segundos (default: 5).")
     p.add_argument("--max-history", type=int, default=50,
                    help="Máximo de líneas visibles por panel.")
     p.add_argument("--vad", action="store_true", default=True,
