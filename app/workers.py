@@ -1,6 +1,7 @@
 """Background worker threads for audio capture + transcription + translation."""
 from __future__ import annotations
 
+import collections
 import queue
 import threading
 import time
@@ -46,31 +47,40 @@ class _RollingContext:
     """Ventana deslizante de palabras recientes para usar como initial_prompt.
 
     Estrategia de tokens (~224 límite de Whisper):
-      - Sin contexto aún  → MEDICAL_PROMPT completo   (~200 tokens)
-      - Con contexto       → MEDICAL_PROMPT_SHORT (~30 tokens)
+      - Sin contexto aún  -> MEDICAL_PROMPT completo   (~200 tokens)
+      - Con contexto       -> MEDICAL_PROMPT_SHORT (~30 tokens)
                            + últimas MAX_WORDS palabras (~130 tokens)
                            = ~160 tokens  (holgura para evitar truncado)
 
-    Salvaguardas contra regresión:
-      - Solo entra texto que pasó el filtro de alucinaciones (garantizado por
-        whisper_engine.transcribe).
-      - Reset automático tras RESET_SECS de silencio (conversación nueva).
-      - Capa máxima de palabras para no saturar el contexto del decoder.
+    Salvaguardas:
+      - Solo entra texto que pasó filtros de alucinación y repetición.
+      - Anti-loop: rechaza texto idéntico al segmento anterior (evita
+        retroalimentar frases repetitivas al decoder).
+      - Reset automático tras RESET_SECS de silencio.
     """
 
-    MAX_WORDS: int = 100        # ~130 tokens, deja margen con el header corto
-    RESET_SECS: float = 45.0   # silencio prolongado = probable cambio de tema
+    MAX_WORDS: int = 100
+    RESET_SECS: float = 45.0
+    _RECENT_DEDUP: int = 5  # cuántos segmentos recientes recordar para dedup
 
     def __init__(self) -> None:
         self._words: list[str] = []
         self._last_ts: float = 0.0
+        self._recent: collections.deque[str] = collections.deque(maxlen=self._RECENT_DEDUP)
 
     def update(self, text: str) -> None:
-        """Agrega texto al contexto; resetea si hubo silencio prolongado."""
+        """Agrega texto al contexto si no es duplicado reciente."""
         now = time.monotonic()
         if self._last_ts and (now - self._last_ts) > self.RESET_SECS:
             self._words.clear()
+            self._recent.clear()
         self._last_ts = now
+
+        normalized = text.strip().lower()
+        if normalized in self._recent:
+            return
+        self._recent.append(normalized)
+
         self._words.extend(text.split())
         if len(self._words) > self.MAX_WORDS:
             self._words = self._words[-self.MAX_WORDS:]
@@ -83,6 +93,7 @@ class _RollingContext:
 
     def reset(self) -> None:
         self._words.clear()
+        self._recent.clear()
         self._last_ts = 0.0
 
 
@@ -97,6 +108,10 @@ class CaptionLine:
 # ---------------------------------------------------------------------------
 # Worker Whisper (local)
 # ---------------------------------------------------------------------------
+_ES_FALLBACK_THRESHOLD: float = 0.7  # prob mínima EN para no intentar ES
+_DEDUP_HISTORY: int = 3              # líneas recientes para deduplicar
+
+
 def worker_system(
     out_q: "queue.Queue[Optional[CaptionLine]]",
     stop_evt: threading.Event,
@@ -107,10 +122,11 @@ def worker_system(
     prompt: str,
     normalize_evt: threading.Event,
 ) -> None:
-    """Loopback audio -> Whisper (auto-detecta EN/ES) -> traducción natural bidireccional."""
+    """Loopback audio -> Whisper (EN/ES doble pasada) -> traducción bidireccional."""
     print(f"[Whisper] Capturando de: {stream.device['name']}", flush=True)
 
     ctx = _RollingContext()
+    recent_lines: collections.deque[str] = collections.deque(maxlen=_DEDUP_HISTORY)
 
     while not stop_evt.is_set():
         try:
@@ -130,15 +146,30 @@ def worker_system(
 
         effective_prompt = ctx.build_prompt(prompt, whisper_engine.MEDICAL_PROMPT_SHORT)
 
-        # language=None → Whisper auto-detecta EN o ES
-        text, lang = whisper_engine.transcribe(
-            model_holder.model, raw, language=None,
+        # Pasada 1: forzar inglés (idioma principal en contexto médico USA)
+        text, lang, prob = whisper_engine.transcribe(
+            model_holder.model, raw, language="en",
             vad_filter=vad_filter, prompt=effective_prompt,
         )
 
+        # Pasada 2: si la confianza EN es baja, intentar español
+        if prob < _ES_FALLBACK_THRESHOLD or not text:
+            text_es, lang_es, prob_es = whisper_engine.transcribe(
+                model_holder.model, raw, language="es",
+                vad_filter=vad_filter, prompt=effective_prompt,
+            )
+            if text_es and prob_es > prob:
+                text, lang, prob = text_es, lang_es, prob_es
+
         if text:
+            # Deduplicar líneas consecutivas idénticas
+            norm_text = text.strip().lower()
+            if norm_text in recent_lines:
+                continue
+            recent_lines.append(norm_text)
+
             ctx.update(text)
-            lang = lang or "en"
+            lang = lang if lang in ("en", "es") else "en"
             to_lang = "en" if lang == "es" else "es"
             try:
                 translated = translation.translate_natural(text, lang, to_lang)
@@ -220,6 +251,74 @@ def worker_deepgram(
             # Enviar TODO el audio (incluyendo silencio) para que Deepgram
             # mantenga el contexto temporal y detecte correctamente
             # el inicio y fin de cada utterance.
+            streamer.send_audio(raw)
+    finally:
+        if streamer:
+            streamer.stop()
+
+
+# ---------------------------------------------------------------------------
+# Worker AssemblyAI (cloud) - Universal Streaming Multilingual
+# ---------------------------------------------------------------------------
+_AAI_CHUNK_SEC: float = 0.1
+
+def worker_assemblyai(
+    out_q: "queue.Queue[Optional[CaptionLine]]",
+    stop_evt: threading.Event,
+    api_key: str,
+    chunk_sec: float,
+    stream: AudioStream,
+    normalize_evt: threading.Event,
+) -> None:
+    """Loopback audio -> AssemblyAI Universal Streaming (code-switching EN/ES)."""
+    from app.assemblyai_engine import AssemblyAIStreamer
+
+    dev_rate = stream.dev_rate
+    print(f"[AssemblyAI] Capturando de: {stream.device['name']} ({dev_rate} Hz)", flush=True)
+
+    def _on_transcript(text: str, lang: str) -> None:
+        lang = lang or "en"
+        to_lang = "en" if lang == "es" else "es"
+        try:
+            translated = translation.translate_natural(text, lang, to_lang)
+        except Exception as e:
+            translated = f"[Traduccion ERROR] {e}"
+        out_q.put(CaptionLine(source=text, translated=translated,
+                               ts=time.time(), source_lang=lang))
+
+    def _on_error(msg: str) -> None:
+        out_q.put(CaptionLine(source="", translated=f"[AssemblyAI] {msg}",
+                               ts=time.time(), source_lang="en"))
+        print(f"[AssemblyAI] {msg}", file=sys.stderr, flush=True)
+
+    streamer: Optional[AssemblyAIStreamer] = None
+    try:
+        streamer = AssemblyAIStreamer(
+            api_key,
+            on_transcript=_on_transcript,
+            on_error=_on_error,
+            sample_rate=dev_rate,
+        )
+        streamer.start()
+    except Exception as e:
+        out_q.put(CaptionLine(source="", translated=f"[AssemblyAI ERROR] {e}",
+                               ts=time.time(), source_lang="en"))
+        print(f"[AssemblyAI] Fallo al conectar: {e}", file=sys.stderr, flush=True)
+        return
+
+    try:
+        while not stop_evt.is_set():
+            try:
+                raw = stream.read(_AAI_CHUNK_SEC, dev_rate)
+            except Exception as e:
+                _on_error(f"[Audio ERROR] {e}")
+                print(traceback.format_exc(), file=sys.stderr)
+                time.sleep(1.0)
+                continue
+
+            if normalize_evt.is_set():
+                raw = _normalize_rms(raw)
+
             streamer.send_audio(raw)
     finally:
         if streamer:

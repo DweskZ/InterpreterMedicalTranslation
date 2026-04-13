@@ -64,16 +64,17 @@ def main() -> None:
                    help="Muestra dispositivos loopback y micrófonos disponibles.")
     p.add_argument("--setup-langs", action="store_true",
                    help="Descarga paquetes Argos en<->es (una vez, requiere internet).")
-    p.add_argument("--backend", default="whisper", choices=["whisper", "deepgram"],
+    p.add_argument("--backend", default="whisper", choices=["whisper", "deepgram", "assemblyai"],
                    help=(
-                       "Motor de transcripción: 'whisper' (local, default) o "
-                       "'deepgram' (cloud, detecta EN y ES automáticamente). "
-                       "Deepgram requiere DEEPGRAM_API_KEY en el archivo .env."
+                       "Motor de transcripción: 'whisper' (local, default), "
+                       "'deepgram' (cloud, Nova-3), o 'assemblyai' (cloud, Universal Streaming). "
+                       "Las opciones cloud requieren API key en .env."
                    ))
-    p.add_argument("--model", default="base.en",
+    p.add_argument("--model", default="small.en",
                    choices=["tiny", "tiny.en", "base", "base.en", "small", "small.en",
                             "medium", "medium.en"],
-                   help="Modelo Whisper. Los '.en' son más precisos para inglés (solo con --backend whisper).")
+                   help="Modelo Whisper (default: small.en). Los '.en' son más precisos para inglés. "
+                        "Modelos más grandes = menos errores pero más RAM GPU.")
     p.add_argument("--chunk-seconds", type=float, default=3.0,
                    help="Ventana de captura en segundos (default: 3).")
     p.add_argument("--max-history", type=int, default=50,
@@ -97,8 +98,9 @@ def main() -> None:
     if args.setup_langs:
         sys.exit(0 if ensure_bidirectional() else 1)
 
-    # Obtener API key de Deepgram desde entorno
+    # Obtener API keys desde entorno
     deepgram_api_key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
+    assemblyai_api_key = os.environ.get("ASSEMBLYAI_API_KEY", "").strip()
 
     if args.backend == "deepgram":
         if not deepgram_api_key:
@@ -110,6 +112,16 @@ def main() -> None:
             )
             sys.exit(1)
         print(f"[Deepgram] API key cargada (últimos 4: …{deepgram_api_key[-4:]})", flush=True)
+    elif args.backend == "assemblyai":
+        if not assemblyai_api_key:
+            print(
+                "ERROR: ASSEMBLYAI_API_KEY no encontrada.\n"
+                "  Crea un archivo .env en la raíz del proyecto con:\n"
+                "    ASSEMBLYAI_API_KEY=tu_api_key_aqui",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"[AssemblyAI] API key cargada (últimos 4: …{assemblyai_api_key[-4:]})", flush=True)
     else:
         # Backend Whisper: necesita Argos para traducción offline (fallback)
         if not ensure_bidirectional():
@@ -131,6 +143,7 @@ def main() -> None:
         prompt=prompt,
         backend=args.backend,
         deepgram_api_key=deepgram_api_key,
+        assemblyai_api_key=assemblyai_api_key,
     )
 
 

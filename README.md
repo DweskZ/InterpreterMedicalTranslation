@@ -2,16 +2,25 @@
 
 Traductor **EN ↔ ES** en tiempo real para intérpretes médicos. Captura el audio del sistema (loopback WASAPI), lo transcribe y muestra la traducción al idioma opuesto en una ventana siempre visible.
 
-Dos motores de transcripción disponibles:
+## Motores de transcripción
 
 | Motor | Modo | Ventajas | Requisitos |
 |-------|------|----------|------------|
 | **Whisper** (default) | Local, GPU/CPU | Sin costo, sin internet, rolling context | NVIDIA GPU recomendada |
-| **Deepgram Nova-3** | Cloud, WebSocket streaming | Detecta EN/ES automáticamente (code-switching) | API key + internet |
+| **Deepgram Nova-3** | Cloud, WebSocket | Detecta EN/ES automáticamente, muy preciso | API key ($200 gratis) |
+| **AssemblyAI** | Cloud, WebSocket | Code-switching EN/ES nativo, 333h gratis/mes | API key (free tier) |
 
-La traducción usa **Google Translate** (natural, gratis vía `deep_translator`) con fallback a **Argos Translate** (offline) si no hay internet.
+## Motores de traducción
 
-> **Aviso:** herramienta asistencial. No sustituye criterio profesional. En entornos sanitarios revisar siempre la salida.
+| Motor | Calidad | Costo | Requisitos |
+|-------|---------|-------|------------|
+| **Google Translate** (default) | Buena | Gratis | Internet |
+| **DeepL** | La mejor para EN/ES | Gratis (500K chars/mes) | API key gratis en deepl.com |
+| **GPT-4o-mini** | Contexto médico nativo | ~$0.003 por consulta | API key de OpenAI |
+
+Siempre con fallback a **Argos Translate** (offline) si no hay internet.
+
+> **Aviso:** herramienta asistencial. No sustituye criterio profesional.
 
 ## Requisitos
 
@@ -23,57 +32,69 @@ La traducción usa **Google Translate** (natural, gratis vía `deep_translator`)
 ## Instalación rápida
 
 ```powershell
-# 1. Clonar o copiar el proyecto
+# 1. Permisos de PowerShell (una sola vez)
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+
+# 2. Clonar o copiar el proyecto
 cd E:\AITrasncriptRealTime
 
-# 2. Crear entorno virtual
+# 3. Crear entorno virtual
 python -m venv .venv
 
-# 3. Activar el entorno virtual
+# 4. Activar el entorno virtual
 .\.venv\Scripts\Activate.ps1
 
-# 4. Instalar dependencias
+# 5. Instalar dependencias
 python -m pip install -r requirements.txt
 
-# 5. Descargar paquetes de idioma Argos (una sola vez, requiere internet)
+# 6. Descargar paquetes de idioma Argos (una sola vez, requiere internet)
 python clinic_translate.py --setup-langs
 ```
 
-## Configuración de Deepgram (opcional)
+## Configuración de APIs (opcional)
 
-Si quieres usar Deepgram Nova-3 como motor de transcripción:
+Crea un archivo `.env` en la raíz del proyecto con las API keys que quieras usar:
 
-1. Crea una cuenta en [deepgram.com](https://deepgram.com) (tiene $200 de crédito gratis)
-2. Crea un archivo `.env` en la raíz del proyecto:
+```env
+# Transcripción cloud (elige una o ambas)
+DEEPGRAM_API_KEY=tu_key_aqui       # deepgram.com ($200 gratis)
+ASSEMBLYAI_API_KEY=tu_key_aqui     # assemblyai.com (333h gratis/mes)
 
+# Traducción mejorada (elige una o ambas)
+DEEPL_API_KEY=tu_key_aqui          # deepl.com/pro-api (500K chars gratis/mes)
+OPENAI_API_KEY=tu_key_aqui         # platform.openai.com (~$0.003 por consulta)
 ```
-DEEPGRAM_API_KEY=tu_api_key_aqui
-```
+
+No necesitas todas. Sin `.env`, la app funciona con Whisper + Google Translate (todo gratis).
 
 ## Uso
 
 ```powershell
-# Iniciar con Whisper (default, local)
+# Whisper local (default)
 .\run.ps1 --model base
 
-# Iniciar directamente con Deepgram (cloud)
+# Deepgram cloud
 .\run.ps1 --backend deepgram
 
-# También puedes cambiar el backend desde la interfaz gráfica en cualquier momento
+# AssemblyAI cloud
+.\run.ps1 --backend assemblyai
 ```
+
+El motor de transcripción y traducción también se puede cambiar desde la interfaz gráfica en cualquier momento.
 
 ### Interfaz
 
-- **Panel izquierdo — TRANSCRIPCIÓN:** todo lo que se escucha, en el idioma original (inglés o español)
+- **Panel izquierdo — TRANSCRIPCIÓN:** todo lo que se escucha (inglés o español)
 - **Panel derecho — TRADUCCIÓN:** la traducción al idioma opuesto
-- **Toolbar:** selector de backend (Whisper/Deepgram), modelo Whisper, normalización de audio, botón Limpiar
+- **Toolbar:** backend (Whisper/Deepgram/AssemblyAI), modelo Whisper, motor de traducción (Google/DeepL/OpenAI), normalizar audio, limpiar
 
-### Opciones de línea de comandos
+### Opciones CLI
 
 | Opción | Descripción |
 |--------|-------------|
 | `--backend whisper` | Motor local (default) |
-| `--backend deepgram` | Motor cloud (requiere `.env` con API key) |
+| `--backend deepgram` | Deepgram Nova-3 (requiere API key en `.env`) |
+| `--backend assemblyai` | AssemblyAI Universal Streaming (requiere API key en `.env`) |
 | `--model base` | Modelo Whisper: `tiny`, `base`, `small`, `medium` (con/sin `.en`) |
 | `--chunk-seconds 3` | Ventana de captura en segundos |
 | `--max-history 50` | Máximo de líneas visibles por panel |
@@ -84,23 +105,19 @@ DEEPGRAM_API_KEY=tu_api_key_aqui
 ## Otra PC
 
 ```powershell
-# Clonar el repo
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 git clone <url-del-repo>
-cd AITrasncriptRealTime
-
-# Crear venv e instalar
+cd InterpreterMedicalTranslation
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 python clinic_translate.py --setup-langs
-
-# Ejecutar
 .\run.ps1 --model base
 ```
 
 ## Solución de problemas
 
-- **`RuntimeError: Library cublas64_12.dll is not found`** — Ejecutar `pip install -r requirements.txt` (incluye CUDA runtime). Alternativa: instalar [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-downloads). Si falla GPU se usa CPU automáticamente.
-- **Sin texto / error de audio** — Verificar que el altavoz predeterminado de Windows es la salida por la que suena el audio. Usar `--list-devices` para ver dispositivos.
+- **`RuntimeError: Library cublas64_12.dll is not found`** — `pip install -r requirements.txt` (incluye CUDA runtime). Si falla GPU se usa CPU automáticamente.
+- **Sin texto / error de audio** — Verificar altavoz predeterminado. Usar `--list-devices`.
 - **Permisos PowerShell** — `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
-- **Aviso Hugging Face (`HF_TOKEN`)** — No es error. Opcional: crear token en [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) y `$env:HF_TOKEN = "hf_..."` antes de ejecutar.
+- **Aviso Hugging Face** — No es error. Opcional: `$env:HF_TOKEN = "hf_..."` antes de ejecutar.

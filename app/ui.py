@@ -7,8 +7,9 @@ import time
 from typing import Optional
 
 from app.audio import AudioStream, pick_loopback
-from app.workers import CaptionLine, worker_system, worker_deepgram
+from app.workers import CaptionLine, worker_system, worker_deepgram, worker_assemblyai
 from app import whisper_engine
+from app import translation
 
 MODEL_CHOICES = ["tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en"]
 
@@ -25,6 +26,7 @@ def run(
     prompt: str,
     backend: str = "whisper",
     deepgram_api_key: str = "",
+    assemblyai_api_key: str = "",
 ) -> None:
     import tkinter as tk
     from tkinter import font as tkfont
@@ -60,7 +62,7 @@ def run(
              font=small_font).pack(side="left", padx=(10, 4))
 
     backend_var = tk.StringVar(value=backend)
-    backend_menu = tk.OptionMenu(toolbar, backend_var, "whisper", "deepgram")
+    backend_menu = tk.OptionMenu(toolbar, backend_var, "whisper", "deepgram", "assemblyai")
     backend_menu.config(
         bg="#2a2a2a", fg="#dddddd", activebackground="#3a3a3a", activeforeground="#ffffff",
         font=small_font, bd=0, highlightthickness=1, highlightbackground="#444444",
@@ -187,6 +189,33 @@ def run(
 
     normalize_var.trace_add("write", _update_norm_indicator)
 
+    tk.Frame(toolbar, bg="#333333", width=1).pack(side="left", fill="y", padx=(4, 8))
+
+    # Selector de motor de traducción
+    tk.Label(toolbar, text="Trad:", fg="#888888", bg="#111111",
+             font=small_font).pack(side="left", padx=(0, 4))
+
+    _TRANSLATE_ENGINES = ["google", "deepl", "openai"]
+    translate_var = tk.StringVar(value="google")
+    translate_menu = tk.OptionMenu(toolbar, translate_var, *_TRANSLATE_ENGINES)
+    translate_menu.config(
+        bg="#2a2a2a", fg="#dddddd", activebackground="#3a3a3a", activeforeground="#ffffff",
+        font=small_font, bd=0, highlightthickness=1, highlightbackground="#444444",
+        relief="flat", padx=6,
+    )
+    translate_menu["menu"].config(
+        bg="#2a2a2a", fg="#dddddd", activebackground="#4a9a7a", activeforeground="#ffffff",
+        font=small_font,
+    )
+    translate_menu.pack(side="left")
+
+    def _on_translate_change(*_) -> None:
+        eng = translate_var.get()
+        translation.set_engine(eng)
+        _set_status(f"Motor de traducción: {eng.upper()}", "#555555")
+
+    translate_var.trace_add("write", _on_translate_change)
+
     tk.Frame(root, bg="#2a2a2a", height=1).pack(fill="x", side="top")
 
     # ── Paneles divididos ─────────────────────────────────────────────────────
@@ -309,6 +338,21 @@ def run(
         _set_status("Escuchando con Deepgram  (detecta EN y ES automáticamente)…", "#555555")
         pump()
 
+    def _start_assemblyai_worker() -> None:
+        stop_evt.clear()
+        threading.Thread(
+            target=worker_assemblyai,
+            args=(q_sys, stop_evt, assemblyai_api_key, chunk_sec, stream_sys, normalize_evt),
+            daemon=True,
+        ).start()
+        backend_badge_var.set("● ASSEMBLYAI")
+        backend_badge.config(fg="#e6a817")
+        whisper_label.pack_forget()
+        model_menu.pack_forget()
+        model_status_lbl.pack_forget()
+        _set_status("Escuchando con AssemblyAI  (detecta EN y ES automáticamente)…", "#555555")
+        pump()
+
     def _start_whisper_worker(mholder: whisper_engine.ModelHolder) -> None:
         stop_evt.clear()
         threading.Thread(
@@ -337,6 +381,15 @@ def run(
             model_menu.pack_forget()
             model_status_lbl.pack_forget()
             _start_deepgram_worker()
+        elif new_backend == "assemblyai":
+            if not assemblyai_api_key:
+                _set_status("ERROR: ASSEMBLYAI_API_KEY no configurado en .env", "#cc4444")
+                backend_var.set("whisper")
+                return
+            whisper_label.pack_forget()
+            model_menu.pack_forget()
+            model_status_lbl.pack_forget()
+            _start_assemblyai_worker()
         else:
             whisper_label.pack(side="left", padx=(0, 4))
             model_menu.pack(side="left")
@@ -351,12 +404,22 @@ def run(
     # ── Carga inicial ─────────────────────────────────────────────────────────
     def _load_initial() -> None:
         nonlocal model_holder
-        if backend_var.get() == "deepgram":
+        initial_backend = backend_var.get()
+
+        if initial_backend == "deepgram":
             if not deepgram_api_key:
                 root.after(0, lambda: _set_status(
                     "ERROR: DEEPGRAM_API_KEY no configurado en .env", "#cc4444"))
                 return
             root.after(0, _start_deepgram_worker)
+            return
+
+        if initial_backend == "assemblyai":
+            if not assemblyai_api_key:
+                root.after(0, lambda: _set_status(
+                    "ERROR: ASSEMBLYAI_API_KEY no configurado en .env", "#cc4444"))
+                return
+            root.after(0, _start_assemblyai_worker)
             return
 
         root.after(0, lambda: _set_status(f"Cargando modelo {effective_model}…", "#e6a817"))

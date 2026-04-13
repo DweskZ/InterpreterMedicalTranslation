@@ -1,18 +1,33 @@
-"""Módulo de traducción: Google Translate (natural) con fallback a Argos (offline).
+"""Módulo de traducción multi-motor.
 
-Jerarquía:
-  1. deep_translator → GoogleTranslator (requiere internet, sin API key, más natural)
-  2. argostranslate   → traducción offline (sin internet, más literal, fallback)
+Jerarquía configurable (según translation_engine):
+  "deepl"   → DeepL API (mejor calidad EN/ES, gratis 500K chars/mes)
+  "openai"  → GPT-4o-mini (contexto médico, centavos por consulta)
+  "google"  → Google Translate vía deep_translator (gratis, sin API key)
+
+Siempre con fallback a Argos Translate (offline) si todo falla.
 """
 from __future__ import annotations
 
-import collections
+import os
 import re
 import sys
 
+# Motor activo (se puede cambiar en runtime desde la UI)
+_active_engine: str = "google"
+
+
+def set_engine(engine: str) -> None:
+    global _active_engine
+    _active_engine = engine
+
+
+def get_engine() -> str:
+    return _active_engine
+
 
 # ---------------------------------------------------------------------------
-# Argos Translate (offline, fallback)
+# Argos Translate (offline, último fallback)
 # ---------------------------------------------------------------------------
 
 def _ensure_pair(from_code: str, to_code: str) -> bool:
@@ -59,69 +74,180 @@ def es_to_en(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Validación de salida de traducción
+# Validación de salida
 # ---------------------------------------------------------------------------
 
-def _is_garbage(result: str, source: str) -> bool:
-    """True si el resultado de la traducción parece basura.
+_NON_LATIN_RE = re.compile(
+    r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\u3400-\u4dbf'
+    r'\u0400-\u04ff\u0600-\u06ff\uac00-\ud7af]',
+)
 
-    Detecta:
-    - Artefactos de parseo de deep_translator (@@, ###, etc.)
-    - Resultado mucho más largo que el texto original (>5x en caracteres)
-    """
+
+def _is_garbage(result: str, source: str) -> bool:
     if not result:
         return False
-
-    # Artefactos conocidos de deep_translator al fallar
     if "@@" in result or "###" in result:
         return True
-
-    # Resultado demasiado largo en relación al original (probable bucle)
     if len(source) > 0 and len(result) > max(200, len(source) * 5):
         return True
-
+    if _NON_LATIN_RE.search(result):
+        return True
     return False
 
 
 # ---------------------------------------------------------------------------
-# Google Translate via deep_translator (natural, requiere internet)
+# Motor 1: DeepL API (mejor calidad para EN/ES)
 # ---------------------------------------------------------------------------
 
+def _translate_deepl(text: str, from_lang: str, to_lang: str) -> str | None:
+    """Traduce con DeepL API. Retorna None si no hay API key o falla."""
+    api_key = os.environ.get("DEEPL_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    try:
+        import urllib.request
+        import urllib.parse
+        import json
+
+        # DeepL usa códigos especiales: "EN" y "ES" (mayúsculas)
+        # Para target, EN necesita ser "EN-US" o "EN-GB"
+        src = from_lang.upper()
+        tgt = to_lang.upper()
+        if tgt == "EN":
+            tgt = "EN-US"
+
+        # Free API usa api-free.deepl.com, Pro usa api.deepl.com
+        host = "api-free.deepl.com" if api_key.endswith(":fx") else "api.deepl.com"
+        url = f"https://{host}/v2/translate"
+
+        data = urllib.parse.urlencode({
+            "auth_key": api_key,
+            "text": text,
+            "source_lang": src,
+            "target_lang": tgt,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+
+        translated = result["translations"][0]["text"].strip()
+        return translated if translated else None
+
+    except Exception as e:
+        print(f"[DeepL] Error ({from_lang}→{to_lang}): {e}", flush=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Motor 2: OpenAI GPT-4o-mini (traducción con contexto médico)
+# ---------------------------------------------------------------------------
+
+_OPENAI_SYSTEM_PROMPT = (
+    "You are a professional medical interpreter. Translate the following text "
+    "accurately, preserving medical terminology and natural conversational tone. "
+    "Only output the translation, nothing else."
+)
+
+
+def _translate_openai(text: str, from_lang: str, to_lang: str) -> str | None:
+    """Traduce con GPT-4o-mini. Retorna None si no hay API key o falla."""
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    lang_names = {"en": "English", "es": "Spanish"}
+    src_name = lang_names.get(from_lang, from_lang)
+    tgt_name = lang_names.get(to_lang, to_lang)
+
+    try:
+        import urllib.request
+        import json
+
+        url = "https://api.openai.com/v1/chat/completions"
+        payload = json.dumps({
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": _OPENAI_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Translate from {src_name} to {tgt_name}:\n\n{text}"},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 500,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+
+        translated = result["choices"][0]["message"]["content"].strip()
+        # GPT a veces añade comillas o prefijos — limpiar
+        translated = translated.strip('"').strip("'")
+        return translated if translated else None
+
+    except Exception as e:
+        print(f"[OpenAI] Error ({from_lang}→{to_lang}): {e}", flush=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Motor 3: Google Translate vía deep_translator (gratis, sin API key)
+# ---------------------------------------------------------------------------
+
+def _translate_google(text: str, from_lang: str, to_lang: str) -> str | None:
+    try:
+        from deep_translator import GoogleTranslator  # type: ignore
+        result = GoogleTranslator(source=from_lang, target=to_lang).translate(text)
+        if result and result.strip() and not _is_garbage(result, text):
+            return result.strip()
+        if result:
+            print(f"[Google] Resultado descartado: {result[:60]!r}", flush=True)
+    except Exception as e:
+        print(f"[Google] Error ({from_lang}→{to_lang}): {e}", flush=True)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Función principal: translate_natural (usa el motor activo + fallbacks)
+# ---------------------------------------------------------------------------
+
+# Orden de fallback por motor
+_ENGINE_CHAINS: dict[str, list] = {
+    "deepl":  [_translate_deepl, _translate_google, _argos_translate],
+    "openai": [_translate_openai, _translate_google, _argos_translate],
+    "google": [_translate_google, _argos_translate],
+}
+
+
 def translate_natural(text: str, from_lang: str, to_lang: str) -> str:
-    """Traduce usando Google Translate (natural). Cae a Argos si falla o sin internet.
+    """Traduce usando el motor activo con fallback automático.
 
-    Args:
-        text: texto a traducir.
-        from_lang: código ISO 639-1 del idioma origen ("en", "es").
-        to_lang:   código ISO 639-1 del idioma destino ("en", "es").
-
-    Returns:
-        Traducción como string. Nunca lanza excepción. Devuelve "" si no pudo
-        producir una traducción válida.
+    Nunca lanza excepción. Devuelve "" si ningún motor pudo traducir.
     """
     text = (text or "").strip()
     if not text or from_lang == to_lang:
         return text
 
-    # ── Intento 1: Google Translate vía deep_translator ──────────────────────
-    try:
-        from deep_translator import GoogleTranslator  # type: ignore
-        # Crear instancia fresca cada vez (evita estado compartido entre threads)
-        result = GoogleTranslator(source=from_lang, target=to_lang).translate(text)
-        if result and result.strip() and not _is_garbage(result, text):
-            return result.strip()
-        if result:
-            print(f"[Traducción] Resultado descartado (garbage): {result[:60]!r}", flush=True)
-    except Exception as e:
-        print(f"[Traducción] Google falló ({from_lang}→{to_lang}): {e}", flush=True)
+    chain = _ENGINE_CHAINS.get(_active_engine, _ENGINE_CHAINS["google"])
 
-    # ── Intento 2: Argos Translate (offline) ─────────────────────────────────
-    try:
-        result = _argos_translate(text, from_lang, to_lang)
-        if result and not _is_garbage(result, text):
-            return result
-    except Exception as e:
-        print(f"[Traducción] Argos falló ({from_lang}→{to_lang}): {e}", flush=True)
+    for fn in chain:
+        try:
+            if fn == _argos_translate:
+                result = fn(text, from_lang, to_lang)
+            else:
+                result = fn(text, from_lang, to_lang)
+            if result and not _is_garbage(result, text):
+                return result
+        except Exception:
+            continue
 
-    # Sin traducción válida: devolver vacío para que el panel no muestre basura
     return ""
